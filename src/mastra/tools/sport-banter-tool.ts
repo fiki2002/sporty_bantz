@@ -15,170 +15,132 @@ const TEAM_IDS: Record<string, string> = {
         "Manchester United": "133612",
         Arsenal: "133604",
         Chelsea: "133610",
-};
-
-const rateLimit = {
-        requests: [] as number[],
-        limit: 1,
-        window: 60000,
-
-        async wait() {
-                const now = Date.now();
-                this.requests = this.requests.filter(time => now - time < this.window);
-
-                if (this.requests.length >= this.limit) {
-                        const oldestRequest = this.requests[0];
-                        const waitTime = this.window - (now - oldestRequest);
-                        console.log(`Rate limit reached. Waiting ${waitTime}ms...`);
-                        await new Promise(resolve => setTimeout(resolve, waitTime));
-                }
-
-                this.requests.push(Date.now());
-        }
+        Barcelona: "133739",
+        "Real Madrid": "133738",
+        PSG: "133722",
+        Juventus: "133676",
 };
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-async function callGeminiWithRetry(prompt: string, maxRetries: number = 3): Promise<string> {
-        let lastError: any;
-
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+async function callGemini(prompt: string, retries = 3): Promise<string> {
+        for (let attempt = 1; attempt <= retries; attempt++) {
                 try {
-                        await rateLimit.wait();
-
-                        console.log(`Gemini API call attempt ${attempt}/${maxRetries}...`);
                         const result = await model.generateContent(prompt);
-                        const text = await result.response.text();
+                        const text = result.response.text();
                         return text.trim();
                 } catch (error: any) {
-                        lastError = error;
-
-                        if (error.statusCode === 429 || error.message?.includes("quota")) {
-                                if (attempt < maxRetries) {
-                                        const waitTime = Math.pow(2, attempt) * 1000;
-                                        console.log(
-                                                `Rate limited on attempt ${attempt}. Retrying in ${waitTime}ms...`
-                                        );
-                                        await delay(waitTime);
-                                        continue;
-                                } else {
-                                        console.error(`Failed after ${maxRetries} attempts due to rate limiting`);
-                                }
-                        }
-
-                        if (attempt === maxRetries) {
+                        if (attempt < retries) {
+                                console.warn(`Gemini error, retrying (${attempt}/${retries})...`);
+                                await delay(1000 * attempt);
+                        } else {
                                 throw error;
                         }
-
-                        const waitTime = Math.pow(2, attempt) * 1000;
-                        console.log(
-                                `Error on attempt ${attempt}: ${error.message}. Retrying in ${waitTime}ms...`
-                        );
-                        await delay(waitTime);
                 }
         }
+        throw new Error("Failed to call Gemini after retries.");
+}
 
-        throw lastError || new Error("Failed to call Gemini API after retries");
+async function classifyIntent(message: string): Promise<string> {
+        const intentPrompt = `
+You are a classifier. Classify this sports-related message into one of these intents:
+[banter, roast, hype, factual, trivia, unknown]
+Message: "${message}"
+Respond with only one word.`;
+        const result = await model.generateContent(intentPrompt);
+        return result.response.text().trim().toLowerCase();
 }
 
 export const sportBanterTool = createTool({
         id: "sport-banter",
         description: `
-    Fetches recent sports results, detects if the user asks about a specific match or player, 
-    and creates fun, witty sports banter or analysis using Google Gemini.
-  `,
+Fetches recent sports results and generates fun, witty, or savage sports banter using Google Gemini.
+It can roast fans, hype wins, or debate players with personality.`,
         inputSchema: z.object({
                 sport: z.string().optional(),
                 league: z.string().optional(),
                 team: z.string().optional(),
                 mood: z.string().optional(),
-                userMessage: z.string().describe("The user's raw message"),
+                userMessage: z.string().describe("The user's message about sports or a team."),
         }),
         outputSchema: z.object({
                 message: z.string(),
         }),
+
         execute: async ({ context }) => {
                 const {
                         sport = "football",
                         league = "4328",
                         team: userTeam,
-                        mood = "funny",
+                        mood,
                         userMessage,
                 } = context;
 
-                try {
-                        const today = dayjs();
-                        let targetDate: string | null = null;
+                const today = dayjs();
+                let targetDate: string | null = null;
+                if (/yesterday/i.test(userMessage)) targetDate = today.subtract(1, "day").format("YYYY-MM-DD");
+                else if (/today/i.test(userMessage)) targetDate = today.format("YYYY-MM-DD");
 
-                        if (/yesterday/i.test(userMessage))
-                                targetDate = today.subtract(1, "day").format("YYYY-MM-DD");
-                        else if (/today/i.test(userMessage))
-                                targetDate = today.format("YYYY-MM-DD");
+                const detectedTeam = Object.keys(TEAM_IDS).find(t => new RegExp(t, "i").test(userMessage));
+                const focusTeam = userTeam || detectedTeam || null;
 
-                        const detectedTeamMatch = Object.keys(TEAM_IDS).find(teamName =>
-                                new RegExp(teamName, "i").test(userMessage)
-                        );
-
-                        const focusTeam = userTeam || detectedTeamMatch || null;
-
-                        let matchSummary = null;
-
-                        if (focusTeam) {
-                                try {
-                                        const teamId = TEAM_IDS[focusTeam];
-                                        const url = `https://www.thesportsdb.com/api/v1/json/${SPORTSDB_API_KEY}/eventslast.php?id=${teamId}`;
-                                        const res = await fetch(url);
-                                        const data = await res.json();
-                                        const matches = data?.results || data?.events || [];
-
-                                        const match = targetDate
-                                                ? matches.find((m: any) => m.dateEvent === targetDate)
-                                                : matches[0];
-
-                                        if (match) {
-                                                matchSummary = `${match.strEvent}: ${match.intHomeScore} - ${match.intAwayScore} (${match.dateEvent})`;
-                                        }
-                                } catch (fetchError) {
-                                        console.warn("Failed to fetch sports data:", fetchError);
+                let matchSummary = null;
+                if (focusTeam) {
+                        try {
+                                const url = `https://www.thesportsdb.com/api/v1/json/${SPORTSDB_API_KEY}/eventslast.php?id=${TEAM_IDS[focusTeam]}`;
+                                const res = await fetch(url);
+                                const data = await res.json();
+                                const matches = data?.results || [];
+                                const match = targetDate
+                                        ? matches.find((m: any) => m.dateEvent === targetDate)
+                                        : matches[0];
+                                if (match) {
+                                        matchSummary = `${match.strEvent}: ${match.intHomeScore} - ${match.intAwayScore} (${match.dateEvent})`;
                                 }
+                        } catch (err) {
+                                console.warn("Failed to fetch sports data:", err);
                         }
+                }
 
-                        let prompt = `
-                                        You are a witty sports commentator with deep knowledge of ${sport}.
-                                        Your tone is ${mood} — fun, playful, and fan-like.
-                                        `;
+                const detectedIntent = await classifyIntent(userMessage);
+                const tone = mood || detectedIntent || "banter";
 
-                        if (matchSummary) {
-                                prompt += `
-                                        User asked: "${userMessage}"
-                                        Focus team: "${focusTeam}"
-                                        Match result: "${matchSummary}"
+                const MOODS: Record<string, string> = {
+                        banter: "Playful, witty, and conversational. Drop lighthearted jokes and puns.",
+                        roast: "Spicy, clever, and cheeky. Roast with humor, but never be mean or toxic.",
+                        hype: "Energetic and fan-like, full of excitement and emojis.",
+                        factual: "Accurate, calm, and informative with a touch of personality.",
+                        trivia: "Fun and curious, like sharing random cool sports facts.",
+                };
 
-                                        Create short, entertaining banter about this match and focus team.
-                                        Use emojis if appropriate.
-                                        `;
-                        } else {
-                                prompt += `
-                        User asked: "${userMessage}"
+                const moodDescription = MOODS[tone] || MOODS.banter;
 
-                        You don't have a specific match, so respond with general sports banter, trivia, or cheeky opinion.
-                        Use emojis if appropriate.
-                        `;
-                        }
+                let prompt = `
+You are SportyBantz — a sports AI who delivers banter, roasts, and witty insights about ${sport}.
+Tone: ${moodDescription}
 
-                        const text = await callGeminiWithRetry(prompt);
+If match data is available, use it for context.
+If not, respond with clever general sports commentary.
 
+User message: "${userMessage}"
+${focusTeam ? `Focus team: ${focusTeam}` : ""}
+${matchSummary ? `Match: ${matchSummary}` : ""}
+`;
+
+                prompt += `
+Structure your response like this:
+1. Start with a playful reaction (e.g. "Oof!", "Mate...", "What a day!")
+2. Add witty or cheeky commentary.
+3. Finish with a short closer or emoji (but don’t overdo it).
+`;
+
+                try {
+                        const text = await callGemini(prompt);
                         return { message: text };
                 } catch (error) {
-                        console.error("Sport banter tool error:", error);
-
-                        const errorMessage =
-                                error instanceof Error && error.message?.includes("quota")
-                                        ? "I'm swamped with requests right now! My AI coach is catching up on highlights. Try again in a few seconds! 🎬⚽️"
-                                        : "Couldn't fetch results or generate banter right now. Maybe my AI coach is off-duty 🤖⚽️";
-
+                        console.error("SportyBantz error:", error);
                         return {
-                                message: errorMessage,
+                                message: "Even my circuits fumbled that one ⚙️ Try again in a sec!",
                         };
                 }
         },
